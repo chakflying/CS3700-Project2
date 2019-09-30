@@ -1,8 +1,8 @@
 use clap::{App, Arg};
 use ipnet::{IpSub, Ipv4Net};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::json;
-use serde_json::{Result, Value};
+use serde_json::{Value};
 use unix_socket::{UnixSeqpacket, UnixSeqpacketListener};
 
 use std::fmt;
@@ -75,6 +75,23 @@ impl fmt::Display for BGPPacketType {
             BGPPacketType::Unknown => "unknown",
         };
         write!(f, "{}", s)
+    }
+}
+
+impl Serialize for BGPPacketType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match *self {
+            BGPPacketType::Update => serializer.serialize_unit_variant("type", 0, "update"),
+            BGPPacketType::Revoke => serializer.serialize_unit_variant("type", 1, "revoke"),
+            BGPPacketType::Data => serializer.serialize_unit_variant("type", 2, "data"),
+            BGPPacketType::NoRoute => serializer.serialize_unit_variant("type", 3, "no route"),
+            BGPPacketType::Dump => serializer.serialize_unit_variant("type", 4, "dump"),
+            BGPPacketType::Table => serializer.serialize_unit_variant("type", 5, "table"),
+            BGPPacketType::Unknown => serializer.serialize_unit_variant("type", 6, "unknown"),
+        }
     }
 }
 
@@ -346,7 +363,7 @@ fn main() {
                                         json!({
                                             "src": nei.ip.saturating_sub(1),
                                             "dst": nei.ip,
-                                            "type": "update",
+                                            "type": BGPPacketType::Update,
                                             "msg": {
                                                 "network": x.network,
                                                 "netmask": x.netmask,
@@ -382,7 +399,7 @@ fn main() {
                                 json!({
                                     "src": neighbors[received.neighbor].ip.saturating_sub(1),
                                     "dst": received.src,
-                                    "type": "no route",
+                                    "type": BGPPacketType::NoRoute,
                                     "msg": {},
                                 })
                                 .to_string(),
@@ -398,7 +415,7 @@ fn main() {
                                 json!({
                                     "src": received.src,
                                     "dst": received.dst,
-                                    "type": "data",
+                                    "type": BGPPacketType::Data,
                                     "msg": msg,
                                 })
                                 .to_string(),
@@ -423,7 +440,7 @@ fn main() {
                         json!({
                             "src": neighbors[received.neighbor].ip.saturating_sub(1),
                             "dst": received.src,
-                            "type": "table",
+                            "type": BGPPacketType::Table,
                             "msg": entries,
                         })
                         .to_string(),
