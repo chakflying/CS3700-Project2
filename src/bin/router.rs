@@ -80,11 +80,19 @@ impl fmt::Display for BGPPacketType {
 
 #[derive(Debug)]
 struct RouteInfo {
+    neighbor: usize,
     net: Ipv4Net,
     localpref: String,
     selfOrigin: String,
     ASPath: Vec<String>,
     origin: RouteOrgin,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RouteInfoJson {
+    network: Ipv4Addr,
+    netmask: Ipv4Addr,
+    peer: Ipv4Addr,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -148,7 +156,7 @@ impl NeighborStream {
             };
             if count > 0 {
                 let s = String::from_utf8_lossy(&buf).to_string();
-                debug!("[{}] Got message with length {}", self.ip, count);
+                debug!("[{}] Got message with length {}: {}", self.ip, count, s);
 
                 let p: Value = match serde_json::from_str(&s[..count]) {
                     Ok(p) => p,
@@ -179,12 +187,14 @@ impl NeighborStream {
                         .unwrap_or("0.0.0.0".parse().unwrap()),
                     p_type: packet_type,
                     msg: match packet_type {
-                        BGPPacketType::Data => PacketMsg::Data(p["msg"].to_string()),
+                        BGPPacketType::Data => {
+                            PacketMsg::Data(p["msg"].as_str().unwrap().to_string())
+                        }
                         BGPPacketType::Update => PacketMsg::Update(
                             serde_json::from_str(&p["msg"].to_string()[..]).expect("WHAT???"),
                         ),
                         BGPPacketType::Revoke => PacketMsg::Revoke(
-                            serde_json::from_str(p["msg"].as_str().unwrap()).expect("WHAT????"),
+                            serde_json::from_str(&p["msg"].to_string()[..]).expect("WHAT????"),
                         ),
                         BGPPacketType::NoRoute => PacketMsg::Empty,
                         BGPPacketType::Dump => PacketMsg::Empty,
@@ -207,6 +217,27 @@ impl NeighborStream {
                 Err(_) => {} // Err(e) => debug!("[{}] Error when sending: {}", self.ip, e),
             }
         }
+    }
+}
+
+fn choose_route(dst: Ipv4Addr, route_table: &Vec<RouteInfo>) -> i32 {
+    let mut potential_routes = vec![];
+    for (i, route) in route_table.iter().enumerate() {
+        if route.net.contains(&dst) {
+            potential_routes.push((i, route));
+        }
+    }
+    debug!(
+        "[Main Thread] choose_route found {} suitable routes for packet to {}",
+        potential_routes.len(),
+        dst
+    );
+    if potential_routes.len() == 1 {
+        potential_routes[0].1.neighbor as i32
+    } else if potential_routes.len() == 0 {
+        -1
+    } else {
+        potential_routes[1].1.neighbor as i32
     }
 }
 
@@ -254,8 +285,10 @@ fn main() {
         });
         neighbors_streams.push(neighbors.last().unwrap().connect(i));
     }
+    info!("Neighbors: {:?}", &neighbors);
+    info!("Streams: {:?}", &neighbors_streams);
 
-    // Start a new thread for each neighbor to listen for and send messages 
+    // Start a new thread for each neighbor to listen for and send messages
     let mut threads = Vec::new();
     for nei in neighbors_streams {
         let new_tx = tx.clone();
@@ -269,17 +302,24 @@ fn main() {
     }
 
     for received in rx {
-        debug!("[Main Thread] Got packet with type {}", received.p_type);
+        debug!(
+            "[Main Thread] Got packet with type {} and dst {}",
+            received.p_type, received.dst
+        );
         packet_history.push(received.clone());
 
         // Process received packet according to its type
         match received.p_type {
             BGPPacketType::Update => {
+                if received.dst != received.src.saturating_sub(1) {
+                    continue;
+                }
                 match received.msg {
                     PacketMsg::Update(x) => {
                         let netmask: u32 = x.netmask.into();
                         let prefix: u8 = netmask.count_ones() as u8;
                         route_table.push(RouteInfo {
+                            neighbor: received.neighbor,
                             net: Ipv4Net::new(x.network, prefix).unwrap(),
                             localpref: x.localpref.clone(),
                             selfOrigin: x.selfOrigin.clone(),
@@ -326,9 +366,70 @@ fn main() {
                 };
             }
             BGPPacketType::Revoke => {}
-            BGPPacketType::Data => {}
+            BGPPacketType::Data => match received.msg {
+                PacketMsg::Data(msg) => {
+                    let nei_no = choose_route(received.dst, &route_table);
+                    if nei_no == -1
+                        || (neighbors[nei_no as usize].n_type != NeighborType::Cust
+                            && neighbors[received.neighbor].n_type != NeighborType::Cust)
+                    {
+                        debug!(
+                            "[Main Thread] Reporting no route to neighbor [{}]",
+                            &neighbors[received.neighbor].ip
+                        );
+                        neighbors_senders[received.neighbor]
+                            .send(
+                                json!({
+                                    "src": neighbors[received.neighbor].ip.saturating_sub(1),
+                                    "dst": received.src,
+                                    "type": "no route",
+                                    "msg": {},
+                                })
+                                .to_string(),
+                            )
+                            .expect("[Main Thread] Error sending message to other thread");
+                    } else {
+                        debug!(
+                            "[Main Thread] Forwarding data to neighbor [{}]",
+                            &neighbors[nei_no as usize].ip
+                        );
+                        neighbors_senders[nei_no as usize]
+                            .send(
+                                json!({
+                                    "src": received.src,
+                                    "dst": received.dst,
+                                    "type": "data",
+                                    "msg": msg,
+                                })
+                                .to_string(),
+                            )
+                            .expect("[Main Thread] Error sending message to other thread");
+                    }
+                }
+                _ => {}
+            },
             BGPPacketType::NoRoute => {}
-            BGPPacketType::Dump => {}
+            BGPPacketType::Dump => {
+                let mut entries = vec![];
+                for route in &route_table {
+                    entries.push(RouteInfoJson {
+                        network: route.net.addr(),
+                        netmask: route.net.netmask(),
+                        peer: neighbors[route.neighbor].ip,
+                    });
+                }
+                neighbors_senders[received.neighbor]
+                    .send(
+                        json!({
+                            "src": neighbors[received.neighbor].ip.saturating_sub(1),
+                            "dst": received.src,
+                            "type": "table",
+                            "msg": entries,
+                        })
+                        .to_string(),
+                    )
+                    .expect("[Main Thread] Error sending message to other thread");
+            }
             BGPPacketType::Table => {}
             BGPPacketType::Unknown => {}
         }
