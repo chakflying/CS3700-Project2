@@ -133,7 +133,7 @@ impl Neighbor {
 impl NeighborStream {
     fn set_timeout(&self) {
         self.stream
-            .set_read_timeout(Some(Duration::new(0, 10000000)))
+            .set_read_timeout(Some(Duration::new(0, 1000000)))
             .expect("Error setting read timeout.");
         self.stream
             .set_write_timeout(Some(Duration::new(1, 0)))
@@ -202,14 +202,14 @@ impl NeighborStream {
                     },
                     neighbor: self.n_id,
                 };
-                debug!("[{}] Parsed Packet: {:?}", self.ip, packet);
+                debug!("[{}] Parsed incoming packet: {:?}", self.ip, packet);
                 tx.send(packet)
-                    .expect("Error sending message back to main thread.");
+                    .expect(&format!("[{}] Error sending message back to main thread.", self.ip)[..]);
             }
             // See if there is anything to send to this Neighbor
             match rx.try_recv() {
                 Ok(msgjson) => {
-                    debug!("[{}] Got message to send: {}", self.ip, msgjson);
+                    debug!("[{}] Message to send: {}", self.ip, msgjson);
                     self.stream
                         .send(msgjson.as_bytes())
                         .expect(&format!("[{}] Error when sending message", self.ip)[..]);
@@ -358,7 +358,7 @@ fn main() {
                                         })
                                         .to_string(),
                                     )
-                                    .expect("Error sending message to other thread");
+                                    .expect("[Main Thread] Error sending message to other thread");
                             }
                         }
                     }
