@@ -1,9 +1,10 @@
+#![allow(non_snake_case)]
 use clap::{App, Arg};
-use ipnet::{IpSub, Ipv4Net};
+use ipnet::{IpAdd, IpSub, Ipv4Net};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::json;
-use serde_json::{Value};
-use unix_socket::{UnixSeqpacket, UnixSeqpacketListener};
+use serde_json::Value;
+use unix_socket::UnixSeqpacket;
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -13,8 +14,8 @@ use std::time::Duration;
 
 #[macro_use]
 extern crate log;
-extern crate env_logger;
-extern crate unix_socket;
+#[macro_use]
+extern crate cute;
 
 #[derive(PartialEq, Copy, Clone, Debug)]
 enum NeighborType {
@@ -34,7 +35,7 @@ enum BGPPacketType {
     Unknown,
 }
 
-#[derive(PartialEq, Debug, Serialize)]
+#[derive(PartialEq, Eq, Debug, Copy, Clone, Serialize, PartialOrd, Ord)]
 enum RouteOrgin {
     IGP,
     EGP,
@@ -95,8 +96,9 @@ impl Serialize for BGPPacketType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RouteInfo {
+    src: Ipv4Addr,
     neighbor: usize,
     net: Ipv4Net,
     localpref: String,
@@ -166,7 +168,7 @@ impl NeighborStream {
             let mut buf = [0; 4096];
             let count = match self.stream.recv(&mut buf) {
                 Ok(c) => c,
-                Err(err) => {
+                Err(_err) => {
                     // debug!("[{}] Recv error: {}", self.ip, err);
                     0
                 }
@@ -220,8 +222,9 @@ impl NeighborStream {
                     neighbor: self.n_id,
                 };
                 debug!("[{}] Parsed incoming packet: {:?}", self.ip, packet);
-                tx.send(packet)
-                    .expect(&format!("[{}] Error sending message back to main thread.", self.ip)[..]);
+                tx.send(packet).expect(
+                    &format!("[{}] Error sending message back to main thread.", self.ip)[..],
+                );
             }
             // See if there is anything to send to this Neighbor
             match rx.try_recv() {
@@ -239,9 +242,9 @@ impl NeighborStream {
 
 fn choose_route(dst: Ipv4Addr, route_table: &Vec<RouteInfo>) -> i32 {
     let mut potential_routes = vec![];
-    for (i, route) in route_table.iter().enumerate() {
+    for route in route_table.iter() {
         if route.net.contains(&dst) {
-            potential_routes.push((i, route));
+            potential_routes.push(route);
         }
     }
     debug!(
@@ -250,12 +253,194 @@ fn choose_route(dst: Ipv4Addr, route_table: &Vec<RouteInfo>) -> i32 {
         dst
     );
     if potential_routes.len() == 1 {
-        potential_routes[0].1.neighbor as i32
+        potential_routes[0].neighbor as i32
     } else if potential_routes.len() == 0 {
         -1
     } else {
-        potential_routes[1].1.neighbor as i32
+        let prefixes = c![x.net.prefix_len(), for x in potential_routes.iter()];
+        let max_prefix = prefixes.iter().max().unwrap().clone();
+        potential_routes.retain(|&x| x.net.prefix_len() == max_prefix);
+        if potential_routes.len() == 1 {
+            potential_routes[0].neighbor as i32
+        } else {
+            let mut localprefs = Vec::new();
+            for route in potential_routes.iter() {
+                localprefs.push(route.localpref.parse::<i32>().unwrap_or(-999));
+            }
+            let highestlocalprefs = localprefs.iter().max().unwrap().clone();
+            potential_routes
+                .retain(|&x| x.localpref.parse::<i32>().unwrap_or(-999) == highestlocalprefs);
+            if potential_routes.len() == 1 {
+                potential_routes[0].neighbor as i32
+            } else {
+                let mut self_origins = Vec::new();
+                for (i, route) in potential_routes.iter().enumerate() {
+                    self_origins.push((i, route.selfOrigin.clone()));
+                }
+                let self_origins_true = c![x.0, for x in self_origins.iter(), if x.1 == "True"];
+                if self_origins_true.len() > 1 {
+                    potential_routes.retain(|&x| x.selfOrigin == "True");
+                }
+                if self_origins_true.len() == 1 {
+                    potential_routes[self_origins_true[0]].neighbor as i32
+                } else {
+                    let aspathlengths = c![x.ASPath.len(), for x in potential_routes.iter()];
+                    let shortest_aspathlength = aspathlengths.iter().min().unwrap().clone();
+                    potential_routes.retain(|&x| x.ASPath.len() == shortest_aspathlength);
+                    if potential_routes.len() == 1 {
+                        potential_routes[0].neighbor as i32
+                    } else {
+                        let origins = c![x.origin, for x in potential_routes.iter()];
+                        let bestorigin = origins.iter().min().unwrap().clone();
+                        potential_routes.retain(|&x| x.origin == bestorigin);
+                        if potential_routes.len() == 1 {
+                            potential_routes[0].neighbor as i32
+                        } else {
+                            let srcaddresses = c![x.src, for x in potential_routes.iter()];
+                            let minsrcaddress = srcaddresses.iter().min().unwrap().clone();
+                            potential_routes.retain(|&x| x.src == minsrcaddress);
+                            potential_routes[0].neighbor as i32
+                        }
+                    }
+                }
+            }
+        }
     }
+}
+
+fn revoke_routes(
+    neighbor: usize,
+    revoke_routes: Vec<MsgRevoke>,
+    mut route_table: Vec<RouteInfo>,
+) -> Vec<RouteInfo> {
+    let mut num_revoked = 0;
+    let mut num_disaggregated = 0;
+    for r in revoke_routes {
+        let netmask: u32 = r.netmask.into();
+        let prefix: u8 = netmask.count_ones() as u8;
+        let r_net = Ipv4Net::new(r.network, prefix).unwrap();
+        route_table.retain(|x| {
+            if !(x.net == r_net && x.neighbor == neighbor) {
+                true
+            } else {
+                num_revoked += 1;
+                false
+            }
+        });
+        let mut add_r = vec![];
+        route_table.retain(|t_route| {
+            if t_route.neighbor != neighbor {
+                true
+            } else {
+                if prefix > t_route.net.prefix_len() {
+                    if t_route.net.contains(&r_net) {
+                        for subnet in t_route.net.subnets(prefix).unwrap() {
+                            if !subnet.contains(&r_net) {
+                                let mut new_route = t_route.clone();
+                                new_route.net = subnet;
+                                add_r.push(new_route);
+                            }
+                        }
+                        num_revoked += 1;
+                        num_disaggregated += 1;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    if r_net.contains(&t_route.net) {
+                        num_revoked += 1;
+                        false
+                    } else {
+                        true
+                    }
+                }
+            }
+        });
+        route_table.append(&mut add_r);
+    }
+    debug!(
+        "[Main Thread] Revoke: {} original routes revoked",
+        num_revoked
+    );
+    debug!(
+        "[Main Thread] Revoke: {} original routes disaggregated",
+        num_disaggregated
+    );
+    route_table
+}
+
+fn aggregate_routes(num_neighbors: usize, mut route_table: Vec<RouteInfo>) -> Vec<RouteInfo> {
+    debug!("[Main Thread] Table before aggregate: {:?}", route_table);
+    let mut iteration = 1;
+    let mut shrinking = true;
+    while shrinking {
+        debug!("[Main Thread] Aggregation Iteration {}", iteration);
+        let mut new_table = Vec::<RouteInfo>::new();
+        let mut avaliable = c![true, for _x in 0..route_table.len()];
+        for i in 0..num_neighbors {
+            for (ri, route) in route_table.iter().enumerate() {
+                if !avaliable[ri] || route.neighbor != i {
+                    continue;
+                }
+                let mut pushed = false;
+                for (roi, other_route) in route_table.iter().enumerate() {
+                    if !(other_route.neighbor == i
+                        && other_route.localpref == route.localpref
+                        && other_route.selfOrigin == route.selfOrigin
+                        && other_route.ASPath == route.ASPath
+                        && other_route.origin == route.origin)
+                        || !avaliable[roi]
+                        || ri == roi
+                    {
+                        continue;
+                    }
+                    debug!(
+                        "[Main Thread] Aggregate checking: route: {}, other_route: {}",
+                        route.net.network(),
+                        other_route.net.network()
+                    );
+                    if other_route.net == route.net {
+                        avaliable[roi] = false;
+                        new_table.push(route.clone());
+                        pushed = true;
+                        break;
+                    } else if other_route.net.broadcast().saturating_add(1) == route.net.network()
+                        || route.net.broadcast().saturating_add(1) == other_route.net.network()
+                        || other_route.net.contains(&route.net)
+                        || route.net.contains(&other_route.net)
+                    {
+                        debug!(
+                            "[Main Thread] Aggregate in combination phase with {} and {}",
+                            route.net, other_route.net
+                        );
+                        let combined =
+                            Ipv4Net::aggregate(&vec![other_route.net.clone(), route.net.clone()]);
+                        if combined.len() == 1 {
+                            avaliable[roi] = false;
+                            let mut new_route = route.clone();
+                            new_route.net = combined[0];
+                            new_table.push(new_route);
+                            pushed = true;
+                            break;
+                        }
+                    }
+                }
+                if pushed == false {
+                    new_table.push(route.clone());
+                }
+            }
+        }
+        if new_table.len() < route_table.len() {
+            shrinking = true;
+            iteration += 1;
+        } else {
+            shrinking = false;
+        }
+        route_table = new_table;
+    }
+    debug!("[Main Thread] Table after aggregate: {:?}", route_table);
+    route_table
 }
 
 fn main() {
@@ -319,9 +504,9 @@ fn main() {
     }
 
     for received in rx {
-        debug!(
-            "[Main Thread] Got packet with type {} and dst {}",
-            received.p_type, received.dst
+        info!(
+            "[Main Thread] Got packet with type {} and src {}",
+            received.p_type, received.src
         );
         packet_history.push(received.clone());
 
@@ -336,6 +521,7 @@ fn main() {
                         let netmask: u32 = x.netmask.into();
                         let prefix: u8 = netmask.count_ones() as u8;
                         route_table.push(RouteInfo {
+                            src: received.src,
                             neighbor: received.neighbor,
                             net: Ipv4Net::new(x.network, prefix).unwrap(),
                             localpref: x.localpref.clone(),
@@ -348,6 +534,7 @@ fn main() {
                                 _ => RouteOrgin::UNK,
                             },
                         });
+                        route_table = aggregate_routes(neighbors.len(), route_table);
 
                         for (i, nei) in neighbors.iter().enumerate() {
                             if i == received.neighbor {
@@ -382,7 +569,41 @@ fn main() {
                     _ => {}
                 };
             }
-            BGPPacketType::Revoke => {}
+            BGPPacketType::Revoke => {
+                if received.dst != received.src.saturating_sub(1) {
+                    continue;
+                }
+                match received.msg {
+                    PacketMsg::Revoke(x) => {
+                        route_table = revoke_routes(received.neighbor, x.clone(), route_table);
+                        route_table = aggregate_routes(neighbors.len(), route_table);
+
+                        for (i, nei) in neighbors.iter().enumerate() {
+                            if i == received.neighbor {
+                                continue;
+                            }
+                            if neighbors[received.neighbor].n_type == NeighborType::Cust
+                                || (neighbors[received.neighbor].n_type != NeighborType::Cust
+                                    && nei.n_type == NeighborType::Cust)
+                            {
+                                debug!("[Main Thread] Forwarding revoke to neighbor [{}]", nei.ip);
+                                neighbors_senders[i]
+                                    .send(
+                                        json!({
+                                            "src": nei.ip.saturating_sub(1),
+                                            "dst": nei.ip,
+                                            "type": BGPPacketType::Revoke,
+                                            "msg": x.clone()
+                                        })
+                                        .to_string(),
+                                    )
+                                    .expect("[Main Thread] Error sending message to other thread");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             BGPPacketType::Data => match received.msg {
                 PacketMsg::Data(msg) => {
                     let nei_no = choose_route(received.dst, &route_table);
